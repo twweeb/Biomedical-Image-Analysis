@@ -2,14 +2,11 @@ import pydicom
 import numpy as np
 import matplotlib.pyplot as plt
 import skimage
+from math import sqrt
 import os
-from pathlib import Path
-from pydicom.data import get_testdata_file
-from pydicom.waveforms import generate_multiplex
-from pydicom import dcmread
 
 dataset_dir = '../CT_chest_scans/'
-numpy_format_dir = '../CT_chest_scans_numpy/'
+result_img_dir = 'CT_chest_scans_segmentation/'
 
 
 def read_by_patient_id(patient_id):
@@ -20,7 +17,6 @@ def read_by_patient_id(patient_id):
 
 
 def print_data_fields(dsm_img):
-    # dsm_img = get_testdata_file(filename)
     ds = pydicom.dcmread(dsm_img)
 
     # get the pixel information into a numpy array
@@ -40,64 +36,67 @@ def print_data_fields(dsm_img):
     print('The information of the data set after downsampling: \n')
     print(ds)
 
-def iterate_patient_records(patient_dir):
-    path = get_testdata_file(patient_dir)
-    ds = dcmread(patient_dir)
-    root_dir = Path(ds.filename).resolve().parent
-    print(f'Root directory: {root_dir}\n')
+def extract_raw_and_hounsfield (dcm_img):
+    ds = pydicom.dcmread(dcm_img)
+    rSlope = ds.RescaleSlope
+    rIntercept = ds.RescaleIntercept
+    instanceNum = ds.InstanceNumber
+    img_height, img_width = ds.pixel_array.shape
+    dcm_img_pixel_array = np.clip(ds.pixel_array, 0, None)
 
-    for patient in ds.patient_records:
-        print(
-            f"PATIENT: PatientID={patient.PatientID}, "
-            f"PatientName={patient.PatientName}"
-        )
+    dcm_img_hu = np.zeros((img_height, img_width))
+    for i in range(img_height):
+        for j in range(img_width):
+            dcm_img_hu[i][j] = dcm_img_pixel_array[i][j]*rSlope + rIntercept
+    return instanceNum, dcm_img_pixel_array, dcm_img_hu
 
-        # Find all the STUDY records for the patient
-        studies = [
-            ii for ii in patient.children if ii.DirectoryRecordType == "STUDY"
-        ]
-        for study in studies:
-            descr = study.StudyDescription or "(no value available)"
-            print(
-                f"{'  ' * 1}STUDY: StudyID={study.StudyID}, "
-                f"StudyDate={study.StudyDate}, StudyDescription={descr}"
-            )
 
-            # Find all the SERIES records in the study
-            all_series = [
-                ii for ii in study.children if ii.DirectoryRecordType == "SERIES"
-            ]
-            for series in all_series:
-                # Find all the IMAGE records in the series
-                images = [
-                    ii for ii in series.children
-                    if ii.DirectoryRecordType == "IMAGE"
-                ]
-                plural = ('', 's')[len(images) > 1]
+def thresholding(img):
+    threshold = 0.24 #img.median()
 
-                descr = getattr(
-                    series, "SeriesDescription", "(no value available)"
-                )
-                print(
-                    f"{'  ' * 2}SERIES: SeriesNumber={series.SeriesNumber}, "
-                    f"Modality={series.Modality}, SeriesDescription={descr} - "
-                    f"{len(images)} SOP Instance{plural}"
-                )
+    white = img>=threshold
+    black = img<threshold
+    img[white] = 1.
+    img[black] = 0.
+    return img
 
-                # Get the absolute file path to each instance
-                #   Each IMAGE contains a relative file path to the root directory
-                elems = [ii["ReferencedFileID"] for ii in images]
-                # Make sure the relative file path is always a list of str
-                paths = [[ee.value] if ee.VM == 1 else ee.value for ee in elems]
-                paths = [Path(*p) for p in paths]
 
-                # List the instance file paths
-                for p in paths:
-                    print(f"{'  ' * 3}IMAGE: Path={os.fspath(p)}")
+def img_nomarlize(img):
+    img_max = img.max()
+    img_min = img.min()
 
-                    # Optionally read the corresponding SOP Instance
-                    # instance = dcmread(Path(root_dir) / p)
-                    # print(instance.PatientName)
+    normalized_img = (img - img_min) / (img_max - img_min)
+
+    return normalized_img
+
+def print_list_of_images(img_list, patient_id):
+    h, w = img_list[0].shape
+    fig = plt.figure(figsize=(10, 10))
+    columns = rows = int(sqrt(len(img_list)))
+
+    # ax enables access to manipulate each of subplots
+    ax = []
+
+    for i in range(columns * rows):
+        ax.append(fig.add_subplot(rows, columns, i + 1))
+        ax[-1].set_title("slice:" + str(i))  # set title
+        plt.imshow(thresholding(img_nomarlize(img_list[i])), cmap='gray')
+        plt.axis('off')
+
+
+    plt.show()  # finally, render the plot
+    if not os.path.exists(result_img_dir):
+        os.mkdir(result_img_dir)
+    fig.savefig(result_img_dir + 'patient_' + str(patient_id))
+
+
+def show_hist(img_pixel):
+    plt.hist(img_pixel.flatten(), bins=50, color='c')
+    plt.title('Normalized Image')
+    # plt.xlabel("Hounsfield Units (HU)")
+    # plt.ylabel("Frequency")
+    plt.show()
+
 
 if __name__ == '__main__':
 
@@ -106,7 +105,33 @@ if __name__ == '__main__':
     for i in range(len(patient_ids)):
         patient_cts = read_by_patient_id(patient_ids[i])
 
-        # iterate_patient_records(patient_cts[0])
-        print_data_fields(patient_cts[0])
+        hu_imgs = list()
+        hu_imgs_id = list()
+        cnt = 0
 
+        for patient_ct in patient_cts:
+            # Read in and print out all the data fields in a DICOM file
+            # print(patient_ct)
+            # print_data_fields(patient_ct)
+
+            patient_ct_id, patient_ct_raw, patient_ct_hu = extract_raw_and_hounsfield (patient_ct)
+
+            # Read in the raw data for a CT slice and convert its pixel values into Hounsfield units.
+            # Compute the max, min, mean and standard deviation of both images (raw data and Hounsfield units).
+            # raw_max, raw_min, raw_mean, raw_std = (patient_ct_raw.max(), patient_ct_raw.min(), patient_ct_raw.mean(), patient_ct_raw.std())
+            # hu_max, hu_min, hu_mean, hu_std = (patient_ct_hu.max(), patient_ct_hu.min(), patient_ct_hu.mean(), patient_ct_hu.std())
+            #
+            # print(f'raw_max: {raw_max}, raw_min: {raw_min}, raw_mean: {raw_mean}, raw_std: {raw_std}')
+            # print(f'hu_max: {hu_max}, hu_min: {hu_min}, hu_mean: {hu_mean}, hu_std: {hu_std}')
+
+            # show_hist(normal_img)
+
+            hu_imgs.append(patient_ct_hu)
+            hu_imgs_id.append(patient_ct_id)
+            cnt = cnt + 1
+            if cnt == 25:
+                break
+
+        hu_imgs = [x for _,x in sorted(zip(hu_imgs_id,hu_imgs))]
+        print_list_of_images(hu_imgs, i)
         break
