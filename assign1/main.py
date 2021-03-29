@@ -89,23 +89,34 @@ def get_pixel_array_from_dicom (dicom_list):
 
 def median_threshold(img):
     flatten_img = img.flatten()
-    zero_idx = flatten_img==0
-    removed_zero = flatten_img[~zero_idx]
-    median = np.median(removed_zero)
+    exclude_part = flatten_img.min()
+    exclude_idx = flatten_img==exclude_part
+    clean_img = flatten_img[~exclude_idx]
+    median = np.median(clean_img)
     return median
 
 def mean_threshold(img):
     flatten_img = img.flatten()
-    zero_idx = flatten_img==0
-    removed_zero = flatten_img[~zero_idx]
-    mean = removed_zero.mean()
+    exclude_part = flatten_img.min()
+    exclude_idx = flatten_img==exclude_part
+    clean_img = flatten_img[~exclude_idx]
+    mean = clean_img.mean()
     return mean
 
-def thresholding(img, threshold):
+def thresholding(img, method, threshold=None):
+    if threshold == None:
+        if method == 'mean':
+            threshold = mean_threshold(img)
+        elif method == 'median':
+            threshold = median_threshold(img)
+        else:
+            raise ValueError
     white = img>=threshold
     black = img<threshold
-    img[white] = 1.
-    img[black] = 0.
+    max_val = img.max()
+    min_val = img.min()
+    img[white] = max_val
+    img[black] = min_val
     return img
 
 
@@ -130,12 +141,10 @@ def print_list_of_images(img_list, patient_id, apply_threshold=True, save_img=Fa
         ax[-1].set_title("slice:" + str(i))  # set title
         normal_img = img_normalize(img_list[i])
         if apply_threshold:
-            threshold = mean_threshold(normal_img)
-            plt.imshow(thresholding(normal_img, threshold), cmap='gray')
+            plt.imshow(thresholding(normal_img, method='mean'), cmap='gray')
         else:
             plt.imshow(normal_img, cmap='gray')
         plt.axis('off')
-
 
     plt.show()  # finally, render the plot
     if save_img:
@@ -169,20 +178,16 @@ def show_hist(img_pixel, threshold_value=None):
     # plt.show()
 
 def flip_black_and_white(imgs):
-    white = (imgs == 1.)
-    new_img = imgs
-    new_img[white] = 0.
-    new_img[~white] = 1.
-    return new_img
+    return 1 - imgs
 
 def draw_in_3D (dicom_files, hu_imgs):
     unset = True
     hu_stack = None
     pix_spacing = None
     z_spacing = None
-    segmentation_imgs = [thresholding(img_normalize(hu_img), mean_threshold(hu_img)) for hu_img in hu_imgs]
+    segmentation_imgs = [thresholding(img_normalize(hu_img), method='mean') for hu_img in hu_imgs]
     for i in range(len(dicom_files)):
-        arr = flip_black_and_white(segmentation_imgs[i])*255
+        arr = segmentation_imgs[i]
 
         if unset:
             imShape = (arr.shape[0], arr.shape[1], len(dicom_files))
@@ -196,12 +201,14 @@ def draw_in_3D (dicom_files, hu_imgs):
                 dist += parity*(cs[1]*cs[5] - cs[2]*cs[4])*ipp[0]
                 dist += parity*(cs[2]*cs[3] - cs[0]*cs[5])*ipp[1]
                 dist += parity*(cs[0]*cs[4] - cs[1]*cs[3])*ipp[2]
-            z_spacing = abs(dist)
+            z_spacing = 1
             unset = False
         hu_stack[:, :, i] = arr
 
     pix_spacing.append(z_spacing)
-    vol = Volume(hu_stack, spacing=pix_spacing)
+    vol = Volume(hu_stack[20:80], spacing=pix_spacing, mode=1)
+    vol.permuteAxes(2,1,0)
+    vol.threshold(above=0.5)
     show(vol)
 
 
@@ -226,6 +233,6 @@ if __name__ == '__main__':
         # print(f'raw_max: {raw_max}, raw_min: {raw_min}, raw_mean: {raw_mean}, raw_std: {raw_std}')
         # print(f'hu_max: {hu_max}, hu_min: {hu_min}, hu_mean: {hu_mean}, hu_std: {hu_std}')
 
-        print_list_of_images(hu_imgs[:25], i, apply_threshold=False, save_img=False)
+        print_list_of_images(hu_imgs[:25], i, apply_threshold=True, save_img=False)
         # draw_in_3D(patient_dicoms, hu_imgs)
         break # demo only one patient
