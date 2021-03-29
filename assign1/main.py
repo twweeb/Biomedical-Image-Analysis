@@ -1,10 +1,12 @@
 import pydicom
-import numpy as np
-import matplotlib.pyplot as plt
-from math import sqrt
 import time
 import os
-from vedo import *
+import scipy.ndimage
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage import measure
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from math import sqrt
 
 dataset_dir = '../CT_chest_scans/'
 result_img_dir = 'CT_chest_scans_segmentation/'
@@ -43,6 +45,7 @@ def compute_statistic(img):
 
     return res.max(), res.min(), res.mean(), res.std()
 
+
 def read_dicom_to_list (patient_dicoms):
     st = time.time()
     dicom_list = list()
@@ -64,7 +67,10 @@ def read_dicom_to_list (patient_dicoms):
 
     if len(dicom_list) <= 0:
         return False
-    dicom_list.sort(key=lambda x: x.InstanceNumber)
+    dicom_list.sort(key=lambda x: x.InstanceNumber, reverse=True)
+    slice_thickness = abs(dicom_list[0].ImagePositionPatient[2] - dicom_list[1].ImagePositionPatient[2])
+    for slice in dicom_list:
+        slice.SliceThickness = slice_thickness
 
     return dicom_list
 
@@ -87,6 +93,7 @@ def get_pixel_array_from_dicom (dicom_list):
 
     return dcm_img_raw_list, dcm_img_hu_list
 
+
 def median_threshold(img):
     flatten_img = img.flatten()
     exclude_part = flatten_img.min()
@@ -95,6 +102,7 @@ def median_threshold(img):
     median = np.median(clean_img)
     return median
 
+
 def mean_threshold(img):
     flatten_img = img.flatten()
     exclude_part = flatten_img.min()
@@ -102,6 +110,7 @@ def mean_threshold(img):
     clean_img = flatten_img[~exclude_idx]
     mean = clean_img.mean()
     return mean
+
 
 def thresholding(img, method, threshold=None):
     if threshold == None:
@@ -127,6 +136,7 @@ def img_normalize(img):
     normalized_img = (img - img_min) / (img_max - img_min)
 
     return normalized_img
+
 
 def print_list_of_images(img_list, patient_id, apply_threshold=True, save_img=False):
     h, w = img_list[0].shape
@@ -165,6 +175,7 @@ def print_one_image(img, img_name):
         os.mkdir(result_img_dir)
     fig.savefig(result_img_dir + img_name)
 
+
 def show_hist(img_pixel, threshold_value=None):
     # remove value 0
     flatten_img = img_pixel.flatten()
@@ -180,36 +191,120 @@ def show_hist(img_pixel, threshold_value=None):
 def flip_black_and_white(imgs):
     return 1 - imgs
 
-def draw_in_3D (dicom_files, hu_imgs):
-    unset = True
-    hu_stack = None
-    pix_spacing = None
-    z_spacing = None
-    segmentation_imgs = [thresholding(img_normalize(hu_img), method='mean') for hu_img in hu_imgs]
-    for i in range(len(dicom_files)):
-        arr = segmentation_imgs[i]
 
-        if unset:
-            imShape = (arr.shape[0], arr.shape[1], len(dicom_files))
-            hu_stack = np.zeros(imShape)
-            pix_spacing = dicom_files[i].PixelSpacing
-            dist = 0
-            for j in range(2):
-                cs = [float(q) for q in dicom_files[j].ImageOrientationPatient]
-                ipp = [float(q) for q in dicom_files[j].ImagePositionPatient]
-                parity = pow(-1, j)
-                dist += parity*(cs[1]*cs[5] - cs[2]*cs[4])*ipp[0]
-                dist += parity*(cs[2]*cs[3] - cs[0]*cs[5])*ipp[1]
-                dist += parity*(cs[0]*cs[4] - cs[1]*cs[3])*ipp[2]
-            z_spacing = 1
-            unset = False
-        hu_stack[:, :, i] = arr
+def get_pixels_hu(slices):
+    image = np.stack([s.pixel_array for s in slices])
+    # Convert to int16 (from sometimes int16),
+    # should be possible as values should always be low enough (<32k)
+    image = image.astype(np.int16)
 
-    pix_spacing.append(z_spacing)
-    vol = Volume(hu_stack[20:80], spacing=pix_spacing, mode=1)
-    vol.permuteAxes(2,1,0)
-    vol.threshold(above=0.5)
-    show(vol)
+    # Set outside-of-scan pixels to 0
+    # The intercept is usually -1024, so air is approximately 0
+    image[image == -2000] = 0
+
+    # Convert to Hounsfield units (HU)
+    for slice_number in range(len(slices)):
+
+        intercept = slices[slice_number].RescaleIntercept
+        slope = slices[slice_number].RescaleSlope
+
+        if slope != 1:
+            image[slice_number] = slope * image[slice_number].astype(np.float64)
+            image[slice_number] = image[slice_number].astype(np.int16)
+
+        image[slice_number] += np.int16(intercept)
+
+    return np.array(image, dtype=np.int16)
+
+
+def resample(image, scan, new_spacing=[1, 1, 1]):
+    # Determine current pixel spacing
+    spacing = np.array([scan[0].SliceThickness] + list(scan[0].PixelSpacing), dtype=np.float32)
+
+    resize_factor = spacing / new_spacing
+    new_real_shape = image.shape * resize_factor
+    new_shape = np.round(new_real_shape)
+    real_resize_factor = new_shape / image.shape
+    new_spacing = spacing / real_resize_factor
+
+    image = scipy.ndimage.interpolation.zoom(image, real_resize_factor, mode='nearest')
+
+    return image, new_spacing
+
+
+def plot_3d(image, threshold=-300):
+    # Position the scan upright,
+    # so the head of the patient would be at the top facing the camera
+    p = image.transpose(2, 1, 0)
+
+    verts, faces, normals, values = measure.marching_cubes(p, threshold)
+
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    plt.axis('off')
+
+    # Fancy indexing: `verts[faces]` to generate a collection of triangles
+    mesh = Poly3DCollection(verts[faces], alpha=0.70)
+    face_color = [255.0/255.0, 54.0/255.0, 57/255.0]
+    mesh.set_facecolor(face_color)
+    ax.add_collection3d(mesh)
+
+    ax.set_xlim(0, p.shape[0])
+    ax.set_ylim(0, p.shape[1])
+    ax.set_zlim(0, p.shape[2])
+
+    plt.show()
+
+
+def largest_label_volume(im, bg=-1):
+    vals, counts = np.unique(im, return_counts=True)
+
+    counts = counts[vals != bg]
+    vals = vals[vals != bg]
+
+    if len(counts) > 0:
+        return vals[np.argmax(counts)]
+    else:
+        return None
+
+
+def segment_lung_mask(image, fill_lung_structures=True):
+    # not actually binary, but 1 and 2.
+    # 0 is treated as background, which we do not want
+    binary_image = np.array(image > -320, dtype=np.int8) + 1
+    labels = measure.label(binary_image)
+
+    # Pick the pixel in the very corner to determine which label is air.
+    #   Improvement: Pick multiple background labels from around the patient
+    #   More resistant to "trays" on which the patient lays cutting the air
+    #   around the person in half
+    background_label = labels[0, 0, 0]
+
+    # Fill the air around the person
+    binary_image[background_label == labels] = 2
+
+    # Method of filling the lung structures (that is superior to something like
+    # morphological closing)
+    if fill_lung_structures:
+        # For every slice we determine the largest solid structure
+        for i, axial_slice in enumerate(binary_image):
+            axial_slice = axial_slice - 1
+            labeling = measure.label(axial_slice)
+            l_max = largest_label_volume(labeling, bg=0)
+
+            if l_max is not None:  # This slice contains some lung
+                binary_image[i][labeling != l_max] = 1
+
+    binary_image -= 1  # Make the image actual binary
+    binary_image = 1 - binary_image  # Invert it, lungs are now 1
+
+    # Remove other air pockets insided body
+    labels = measure.label(binary_image, background=0)
+    l_max = largest_label_volume(labels, bg=0)
+    if l_max is not None:  # There are air pockets
+        binary_image[labels != l_max] = 0
+
+    return binary_image
 
 
 if __name__ == '__main__':
@@ -233,6 +328,14 @@ if __name__ == '__main__':
         # print(f'raw_max: {raw_max}, raw_min: {raw_min}, raw_mean: {raw_mean}, raw_std: {raw_std}')
         # print(f'hu_max: {hu_max}, hu_min: {hu_min}, hu_mean: {hu_mean}, hu_std: {hu_std}')
 
-        print_list_of_images(hu_imgs[:25], i, apply_threshold=True, save_img=False)
-        # draw_in_3D(patient_dicoms, hu_imgs)
+        print_list_of_images(hu_imgs[:25], i, apply_threshold=False, save_img=False)
+
+        # Plot Patient's CT in 3D resampling
+        # patient_pixels = get_pixels_hu(patient_dicoms)
+        # patient_pixels_resampled, spacing = resample(patient_pixels, patient_dicoms, [1,1,1])
+        # print("Shape before resampling\t", patient_pixels.shape)
+        # print("Shape after resampling\t", patient_pixels_resampled.shape)
+        # segmented_lungs = segment_lung_mask(patient_pixels_resampled, False)
+        # plot_3d(segmented_lungs, 0)
+
         break # demo only one patient
